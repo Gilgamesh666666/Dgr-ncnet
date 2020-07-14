@@ -1,0 +1,286 @@
+Host:  node01
+Conda  /home/Gilgamesh/anaconda3/envs/pytorch1.3/bin/conda
+/home/Gilgamesh/DeepGlobalRegistration/scripts
+Version:  d6fd1dd3ef91c5720dfd73518c1c25369ccf1de1
+Git diff
+
+diff --git a/core/knn.py b/core/knn.py
+index a5f92e9..47d7680 100644
+--- a/core/knn.py
++++ b/core/knn.py
+@@ -19,7 +19,7 @@ def find_knn_cpu(feat0, feat1, knn=1, return_distance=False):
+   else:
+     return nn_inds
+ 
+-
++# 对每一个F0 find一个nearest F1
+ def find_knn_gpu(F0, F1, nn_max_n=-1, knn=1, return_distance=False):
+ 
+   def knn_dist(f0, f1, knn=1, dist_type='L2'):
+diff --git a/core/metrics.py b/core/metrics.py
+index 0fa1e76..515e22f 100644
+--- a/core/metrics.py
++++ b/core/metrics.py
+@@ -28,6 +28,7 @@ def batch_rotation_error(rots1, rots2):
+   rots1: B x 3 x 3 or B x 9
+   rots1: B x 3 x 3 or B x 9
+   """
++  
+   assert len(rots1) == len(rots2)
+   trace_r1Tr2 = (rots1.reshape(-1, 9) * rots2.reshape(-1, 9)).sum(1)
+   side = (trace_r1Tr2 - 1) / 2
+diff --git a/core/registration.py b/core/registration.py
+index 8a7bd5d..d98c2b0 100644
+--- a/core/registration.py
++++ b/core/registration.py
+@@ -92,18 +92,24 @@ def weighted_procrustes(X, Y, w, eps):
+   """
+   X: torch tensor N x 3
+   Y: torch tensor N x 3
+-  w: torch tensor N
++  w: torch tensor N,1
+   """
+   # https://ieeexplore.ieee.org/document/88573
+   assert len(X) == len(Y)
+   W1 = torch.abs(w).sum()
+   w_norm = w / (W1 + eps)
++  print(f'w = {w}\nW1 = {W1}\nw_norm = {w_norm}')
+   mux = (w_norm * X).sum(0, keepdim=True)
+   muy = (w_norm * Y).sum(0, keepdim=True)
+ 
+   # Use CPU for small arrays
+   Sxy = (Y - muy).t().mm(w_norm * (X - mux)).cpu().double()
+-  U, D, V = Sxy.svd()
++  print(f'Sxy = {Sxy}')
++  try:
++      U, D, V = torch.svd(Sxy, some=False, compute_uv=True)
++  except:                     # torch.svd may have convergence issues for GPU and CPU.
++      U, D, V = torch.svd(Sxy + 1e-4*Sxy.mean()*torch.rand(0, 1), some=False, compute_uv=True)
++  #U, D, V = Sxy.svd()
+   S = torch.eye(3).double()
+   if U.det() * V.det() < 0:
+     S[-1, -1] = -1
+@@ -131,7 +137,8 @@ class Transformation(torch.nn.Module):
+     rot_mat = ortho2rotation(self.rot6d)
+     return points @ rot_mat[0].t() + self.trans
+ 
+-
++#这就是接在correspondence confidence prediction后面的registration部分
++# weight就是confidence,用SVD解
+ def GlobalRegistration(points,
+         trans_points,
+         weights=None,
+@@ -152,14 +159,14 @@ def GlobalRegistration(points,
+     if weights is not None:
+       weights.requires_grad = False
+     loss_fn = HighDimSmoothL1Loss(weights, quantization_size)
+-
++  # 算R,t结果
+   if weights is None:
+     # Get the initialization using https://ieeexplore.ieee.org/document/88573
+     R, t = argmin_se3_squared_dist(points, trans_points)
+   else:
+     R, t = weighted_procrustes(points, trans_points, weights, loss_fn.eps)
+   transformation = Transformation(R, t).to(points.device)
+-
++  # 并准备用SGD refine
+   optimizer = optim.Adam(transformation.parameters(), lr=1e-1)
+   scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.999)
+   loss_prev = loss_fn(transformation(points), trans_points).item()
+diff --git a/core/trainer.py b/core/trainer.py
+index b8ae434..fe89248 100644
+--- a/core/trainer.py
++++ b/core/trainer.py
+@@ -46,7 +46,7 @@ class WeightedProcrustesTrainer:
+                       'training is performed on CPU.')
+       raise ValueError('GPU not available, but cuda flag set')
+     self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+-
++    
+     self.config = config
+ 
+     # Training config
+@@ -201,6 +201,7 @@ class WeightedProcrustesTrainer:
+         data_time += data_timer.toc(average=False)
+ 
+         # Initial inlier prediction with FCGF and KNN matching
++        # 6维
+         reg_coords, reg_feats, pred_pairs, is_correct, feat_time, nn_time = self.generate_inlier_input(
+             xyz0=input_dict['pcd0'],
+             xyz1=input_dict['pcd1'],
+@@ -249,11 +250,12 @@ class WeightedProcrustesTrainer:
+ 
+         # Registration loss against registration GT
+         loss = self.config.procrustes_loss_weight * individual_loss[valid_mask].mean()
++        
+         if not np.isfinite(loss.item()):
+           max_val = loss.item()
+           logging.info('Loss is infinite, abort ')
+           continue
+-
++        # 之前算出来的is_correct作为监督,监督correspondence confidence prediction的结果
+         # Direct inlier loss against nearest neighbor searched GT
+         target = torch.from_numpy(is_correct).squeeze()
+         if self.config.inlier_use_direct_loss:
+@@ -576,12 +578,12 @@ class WeightedProcrustesTrainer:
+     ts.require_grad = False
+ 
+     return Rs, ts
+-
++  # 不带SGD refine和safe guard
+   def weighted_procrustes(self, xyz0s, xyz1s, pred_pairs, weights):
+     decomposed_weights = self.decompose_by_length(weights, pred_pairs)
+     RT = []
+     ws = []
+-
++    
+     for xyz0, xyz1, pred_pair, w in zip(xyz0s, xyz1s, pred_pairs, decomposed_weights):
+       xyz0.requires_grad = False
+       xyz1.requires_grad = False
+@@ -628,6 +630,7 @@ class WeightedProcrustesTrainer:
+     return reg_feat
+ 
+   def generate_inlier_input(self, xyz0, xyz1, iC0, iC1, iF0, iF1, len_batch, pos_pairs):
++    # 所有点的feature的correspondence都计算出来
+     # pairs consist of (xyz1 index, xyz0 index)
+     stime = time.time()
+     sinput0 = ME.SparseTensor(iF0, coords=iC0).to(self.device)
+@@ -638,7 +641,7 @@ class WeightedProcrustesTrainer:
+     feat_time = time.time() - stime
+ 
+     stime = time.time()
+-    pred_pairs = self.find_pairs(oF0, oF1, len_batch)
++    pred_pairs = self.find_pairs(oF0, oF1, len_batch) #[[若干,2]...batch个]
+     nn_time = time.time() - stime
+ 
+     is_correct = find_correct_correspondence(pos_pairs, pred_pairs, len_batch=len_batch)
+@@ -651,6 +654,7 @@ class WeightedProcrustesTrainer:
+ 
+     cat_pred_pairs = torch.cat(cat_pred_pairs, 0)
+     pred_pair_inds0, pred_pair_inds1 = cat_pred_pairs.t()
++    # IC1还有个batch维
+     reg_coords = torch.cat((iC0[pred_pair_inds0], iC1[pred_pair_inds1, 1:]), 1)
+     reg_feats = self.generate_inlier_features(xyz0, xyz1, iC0, iC1, oF0, oF1,
+                                               pred_pair_inds0, pred_pair_inds1).float()
+@@ -658,6 +662,7 @@ class WeightedProcrustesTrainer:
+     return reg_coords, reg_feats, pred_pairs, is_correct, feat_time, nn_time
+ 
+   def find_pairs(self, F0, F1, len_batch):
++    # 对每一个F0 find一个最近的F1
+     nn_batch = find_knn_batch(F0,
+                               F1,
+                               len_batch,
+@@ -667,10 +672,12 @@ class WeightedProcrustesTrainer:
+                               search_method=self.config.knn_search_method)
+ 
+     pred_pairs = []
++    # len(nns) == F0.shape[0]
+     for nns, lens in zip(nn_batch, len_batch):
+       pred_pair_ind0, pred_pair_ind1 = torch.arange(
+           len(nns)).long()[:, None], nns.long().cpu()
+       nn_pairs = []
++      # 处理knn k>1情况
+       for j in range(nns.shape[1]):
+         nn_pairs.append(
+             torch.cat((pred_pair_ind0.cpu(), pred_pair_ind1[:, j].unsqueeze(1)), 1))
+diff --git a/scripts/download_3dmatch.sh b/scripts/download_3dmatch.sh
+index c126042..bce183a 100755
+--- a/scripts/download_3dmatch.sh
++++ b/scripts/download_3dmatch.sh
+@@ -19,7 +19,7 @@ function download() {
+     cd "$TMP_PATH"
+ 
+     echo ">> Start downloading"
+-    echo ${urls[@]} | xargs -n 1 -P 3 wget --no-check-certificate -q -c --show-progress $0 
++    echo ${urls[@]} | xargs -n 1 -P 3 wget --no-check-certificate
+ 
+     echo ">> Unpack .zip file"
+     for filename in *.tgz
+diff --git a/scripts/train_3dmatch.sh b/scripts/train_3dmatch.sh
+index 668a7ca..f792cce 100755
+--- a/scripts/train_3dmatch.sh
++++ b/scripts/train_3dmatch.sh
+@@ -1,4 +1,6 @@
+ #! /bin/bash
++export THREED_MATCH_DIR="/home/Gilgamesh/Datasets/FCGF_3dmatch_data/threedmatch"
++export FCGF_WEIGHTS="/home/Gilgamesh/DeepGlobalRegistration/2019-08-16_19-21-47.pth"
+ export PATH_POSTFIX=$1
+ export MISC_ARGS=$2
+ 
+@@ -7,12 +9,12 @@ export DATASET=${DATASET:-ThreeDMatchPairDataset03}
+ export THREED_MATCH_DIR=${THREED_MATCH_DIR}
+ export MODEL=${MODEL:-ResUNetBN2C}
+ export MODEL_N_OUT=${MODEL_N_OUT:-32}
+-export FCGF_WEIGHTS=${FCGF_WEIGHTS:fcgf.pth}
++#export FCGF_WEIGHTS=${FCGF_WEIGHTS:fcgf.pth}
+ export INLIER_MODEL=${INLIER_MODEL:-ResUNetBNF}
+ export OPTIMIZER=${OPTIMIZER:-SGD}
+ export LR=${LR:-1e-1}
+ export MAX_EPOCH=${MAX_EPOCH:-100}
+-export BATCH_SIZE=${BATCH_SIZE:-8}
++export BATCH_SIZE=${BATCH_SIZE:-4}
+ export ITER_SIZE=${ITER_SIZE:-1}
+ export VOXEL_SIZE=${VOXEL_SIZE:-0.05}
+ export POSITIVE_PAIR_SEARCH_VOXEL_SIZE_MULTIPLIER=${POSITIVE_PAIR_SEARCH_VOXEL_SIZE_MULTIPLIER:-4}
+@@ -43,7 +45,7 @@ echo "" | tee -a $LOG
+ nvidia-smi | tee -a $LOG
+ 
+ # Training
+-python train.py \
++CUDA_VISIBLE_DEVICES=1 CUDA_LAUNCH_BLOCKING=1 python train.py \
+ 	--weights ${FCGF_WEIGHTS} \
+ 	--dataset ${DATASET} \
+ 	--threed_match_dir ${THREED_MATCH_DIR} \
+@@ -60,8 +62,10 @@ python train.py \
+ 	--voxel_size ${VOXEL_SIZE} \
+ 	--out_dir ${OUT_DIR} \
+ 	--use_random_scale ${RANDOM_SCALE} \
++	--clip_weight_thresh 0\
+ 	--positive_pair_search_voxel_size_multiplier ${POSITIVE_PAIR_SEARCH_VOXEL_SIZE_MULTIPLIER} \
+ 	$MISC_ARGS 2>&1 | tee -a $LOG
++	
+ 
+ # Test
+ python -m scripts.test_3dmatch \
+diff --git a/train.py b/train.py
+index 394e17a..968d79b 100644
+--- a/train.py
++++ b/train.py
+@@ -16,7 +16,7 @@ from config import get_config
+ 
+ from dataloader.data_loaders import make_data_loader
+ 
+-from core.trainer import WeightedProcrustesTrainer
++from core.mytrainer import WeightedProcrustesTrainer
+ 
+ ch = logging.StreamHandler(sys.stdout)
+ logging.getLogger().setLevel(logging.INFO)
+
+Sun Jul 12 09:47:38 2020       
++-----------------------------------------------------------------------------+
+| NVIDIA-SMI 418.39       Driver Version: 418.39       CUDA Version: 10.1     |
+|-------------------------------+----------------------+----------------------+
+| GPU  Name        Persistence-M| Bus-Id        Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp  Perf  Pwr:Usage/Cap|         Memory-Usage | GPU-Util  Compute M. |
+|===============================+======================+======================|
+|   0  TITAN Xp            On   | 00000000:04:00.0 Off |                  N/A |
+| 23%   26C    P8     9W / 250W |   1869MiB / 12196MiB |      0%      Default |
++-------------------------------+----------------------+----------------------+
+|   1  TITAN Xp            On   | 00000000:08:00.0 Off |                  N/A |
+| 23%   24C    P8     9W / 250W |      0MiB / 12196MiB |      0%      Default |
++-------------------------------+----------------------+----------------------+
+|   2  TITAN Xp            On   | 00000000:85:00.0 Off |                  N/A |
+| 23%   28C    P8     9W / 250W |    300MiB / 12196MiB |      0%      Default |
++-------------------------------+----------------------+----------------------+
+|   3  TITAN Xp            On   | 00000000:89:00.0 Off |                  N/A |
+| 23%   25C    P8     8W / 250W |      0MiB / 12196MiB |      0%      Default |
++-------------------------------+----------------------+----------------------+
+                                                                               
++-----------------------------------------------------------------------------+
+| Processes:                                                       GPU Memory |
+|  GPU       PID   Type   Process name                             Usage      |
+|=============================================================================|
+|    0     30089      C   .../majingda/anaconda3/envs/mjd/bin/python  1859MiB |
++-----------------------------------------------------------------------------+
+python: can't open file 'train.py': [Errno 2] No such file or directory
+/home/Gilgamesh/anaconda3/envs/pytorch1.3/bin/python: Error while finding module specification for 'scripts.test_3dmatch' (ModuleNotFoundError: No module named 'scripts')
