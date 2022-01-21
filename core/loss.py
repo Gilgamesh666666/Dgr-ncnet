@@ -1,3 +1,11 @@
+'''
+Author: your name
+Date: 2020-11-27 20:40:42
+LastEditTime: 2020-11-30 10:48:52
+LastEditors: Please set LastEditors
+Description: In User Settings Edit
+FilePath: /exp2/core/loss.py
+'''
 # Copyright (c) Chris Choy (chrischoy@ai.stanford.edu) and Wei Dong (weidong@andrew.cmu.edu)
 #
 # Please cite the following papers if you use any part of the code.
@@ -53,7 +61,7 @@ class HighDimSmoothL1Loss:
     use_sq_half = 0.5 * (sq_dist < 1).float()
 
     loss = (0.5 - use_sq_half) * (torch.sqrt(sq_dist + self.eps) -
-                                  0.5) + use_sq_half * sq_dist
+                                  0.5) + use_sq_half * sq_dist # [0,1]区间平滑后的L1 loss（关于feature的norm的L1 loss）
 
     if self.weights is None:
       return loss.mean()

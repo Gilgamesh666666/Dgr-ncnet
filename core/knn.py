@@ -19,35 +19,34 @@ def find_knn_cpu(feat0, feat1, knn=1, return_distance=False):
   else:
     return nn_inds
 
-# 对每一个F0 find一个nearest F1
+
 def find_knn_gpu(F0, F1, nn_max_n=-1, knn=1, return_distance=False):
 
   def knn_dist(f0, f1, knn=1, dist_type='L2'):
     knn_dists, knn_inds = [], []
-    #with torch.no_grad():
-    dist = pdist(f0, f1, dist_type=dist_type)
-    min_dist, ind = dist.min(dim=1, keepdim=True)
+    with torch.no_grad():
+      dist = pdist(f0, f1, dist_type=dist_type)
+      min_dist, ind = dist.min(dim=1, keepdim=True)
 
-    knn_dists.append(min_dist)
-    knn_inds.append(ind)
+      knn_dists.append(min_dist)
+      knn_inds.append(ind)
 
-    if knn > 1:
-      for k in range(knn - 1):
-        NR, NC = dist.shape
-        flat_ind = (torch.arange(NR) * NC).type_as(ind) + ind.squeeze()
-        dist.view(-1)[flat_ind] = np.inf
-        min_dist, ind = dist.min(dim=1, keepdim=True)
+      if knn > 1:
+        for k in range(knn - 1):
+          NR, NC = dist.shape
+          flat_ind = (torch.arange(NR) * NC).type_as(ind) + ind.squeeze()
+          dist.view(-1)[flat_ind] = np.inf
+          min_dist, ind = dist.min(dim=1, keepdim=True)
 
-        knn_dists.append(min_dist)
-        knn_inds.append(ind)
+          knn_dists.append(min_dist)
+          knn_inds.append(ind)
 
     min_dist = torch.cat(knn_dists, 1)
     ind = torch.cat(knn_inds, 1)
 
     return min_dist, ind
-  #print(f'find_knn_gpu = {F0.requires_grad}')
+
   # Too much memory if F0 or F1 large. Divide the F0
-  
   if nn_max_n > 1:
     N = len(F0)
     C = int(np.ceil(N / nn_max_n))
@@ -55,8 +54,8 @@ def find_knn_gpu(F0, F1, nn_max_n=-1, knn=1, return_distance=False):
     dists, inds = [], []
 
     for i in range(C):
-      #with torch.no_grad():
-      dist, ind = knn_dist(F0[i * stride:(i + 1) * stride], F1, knn=knn, dist_type='L2')
+      with torch.no_grad():
+        dist, ind = knn_dist(F0[i * stride:(i + 1) * stride], F1, knn=knn, dist_type='L2')
       dists.append(dist)
       inds.append(ind)
 
@@ -67,7 +66,7 @@ def find_knn_gpu(F0, F1, nn_max_n=-1, knn=1, return_distance=False):
   else:
     dist = pdist(F0, F1, dist_type='SquareL2')
     min_dist, inds = dist.min(dim=1)
-    dists = min_dist.unsqueeze(1) #.cpu()
+    dists = min_dist.detach().unsqueeze(1) #.cpu()
     # inds = inds.cpu()
   if return_distance:
     return inds, dists
@@ -84,7 +83,6 @@ def find_knn_batch(F0,
                    search_method=None,
                    concat_results=False):
   if search_method is None or search_method == 'gpu':
-    #print(f'find_knn_batch = {F0.requires_grad}')
     return find_knn_gpu_batch(
         F0,
         F1,
@@ -95,6 +93,14 @@ def find_knn_batch(F0,
         concat_results=concat_results)
   elif search_method == 'cpu':
     return find_knn_cpu_batch(
+        F0,
+        F1,
+        len_batch=len_batch,
+        knn=knn,
+        return_distance=return_distance,
+        concat_results=concat_results)
+  elif search_method == 'cuda':
+    return find_knn_cuda_batch(
         F0,
         F1,
         len_batch=len_batch,
@@ -114,7 +120,6 @@ def find_knn_gpu_batch(F0,
                        concat_results=False):
   dists, nns = [], []
   start0, start1 = 0, 0
-  #print(f'find_knn_gpu_batch = {F0.requires_grad}')
   for N0, N1 in len_batch:
     nn = find_knn_gpu(
         F0[start0:start0 + N0],
@@ -177,3 +182,32 @@ def find_knn_cpu_batch(F0,
     return torch.from_numpy(nns), torch.from_numpy(dists)
   else:
     return torch.from_numpy(nns)
+
+def find_knn_cuda(F0,
+                  F1,
+                  len_batch,
+                  knn=1,
+                  return_distance=False,
+                  concat_results=False,
+                  bilateral=False):
+  from extension.knn import knnModule
+  dist = knnModule()
+  dists, nns = [], []
+  start0, start1 = 0, 0
+  #[b, c, n] [b, c, m]
+  
+  for N0, N1 in len_batch:
+    data1 = F0[start0:start0 + N0].transpose(1, 0).unsqueeze(0)
+    data2 = F1[start1:start1 + N1].transpose(1, 0).unsqueeze(0)
+    result = dist(data1, data2, knn, bilateral, return_distance, True)
+    for i in range(len(result)):
+      result[i] = result[i].squeeze(0).transpose(1, 0)
+    #[b, k, n] [b, k, m] -> [n, k], [m, k]
+    if return_dist and bilateral:
+      dist1, dist2, idx1, idx2 = result
+    elif return_dist and (not bilateral):
+      dist1, idx1 = result
+    elif (not return_dist) and bilateral:
+      idx1, idx2 = result
+    elif (not return_dist) and (not bilateral):
+      idx1 = result

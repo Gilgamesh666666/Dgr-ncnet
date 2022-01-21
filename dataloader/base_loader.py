@@ -47,11 +47,15 @@ class CollationFunctionFactory:
 
     xyz0, xyz1, coords0, coords1, feats0, feats1, matching_inds, trans, extra_packages = list(
         zip(*list_data))
+    xyz0_batch, xyz1_batch = [], []
+    coords0_batch, coords1_batch = [], []
+    feats0_batch, feats1_batch = [], []
+    extra_packages_batch = []
     matching_inds_batch, trans_batch, len_batch = [], [], []
 
-    coords_batch0 = ME.utils.batched_coordinates(coords0)
-    coords_batch1 = ME.utils.batched_coordinates(coords1)
-    trans_batch = torch.from_numpy(np.stack(trans)).float()
+    #coords_batch0 = ME.utils.batched_coordinates(coords0)
+    #coords_batch1 = ME.utils.batched_coordinates(coords1)
+    #trans_batch = torch.from_numpy(np.stack(trans)).float()
 
     curr_start_inds = torch.zeros((1, 2), dtype=torch.int32)
     for batch_id, _ in enumerate(coords0):
@@ -59,6 +63,14 @@ class CollationFunctionFactory:
       # This check will skip these pairs while not affecting other datasets
       if (len(matching_inds[batch_id]) == 0):
         continue
+      xyz0_batch.append(xyz0[batch_id])
+      xyz1_batch.append(xyz1[batch_id])
+      coords0_batch.append(coords0[batch_id])
+      coords1_batch.append(coords1[batch_id])
+      feats0_batch.append(feats0[batch_id])
+      feats1_batch.append(feats1[batch_id])
+      trans_batch.append(trans[batch_id])
+      extra_packages_batch.append(extra_packages[batch_id])
 
       N0 = coords0[batch_id].shape[0]
       N1 = coords1[batch_id].shape[0]
@@ -76,8 +88,11 @@ class CollationFunctionFactory:
       curr_start_inds[0, 1] += N1
 
     # Concatenate all lists
-    feats_batch0 = torch.cat(feats0, 0).float()
-    feats_batch1 = torch.cat(feats1, 0).float()
+    coords_batch0 = ME.utils.batched_coordinates(coords0_batch)
+    coords_batch1 = ME.utils.batched_coordinates(coords1_batch)
+    trans_batch = torch.from_numpy(np.stack(trans_batch)).float()
+    feats_batch0 = torch.cat(feats0_batch, 0).float()
+    feats_batch1 = torch.cat(feats1_batch, 0).float()
     # xyz_batch0 = torch.cat(xyz0, 0).float()
     # xyz_batch1 = torch.cat(xyz1, 0).float()
     # trans_batch = torch.cat(trans_batch, 0).float()
@@ -85,16 +100,16 @@ class CollationFunctionFactory:
       matching_inds_batch = torch.cat(matching_inds_batch, 0).int()
 
     return {
-        'pcd0': xyz0,
-        'pcd1': xyz1,
+        'pcd0': xyz0_batch,
+        'pcd1': xyz1_batch,
         'sinput0_C': coords_batch0,
         'sinput0_F': feats_batch0,
         'sinput1_C': coords_batch1,
         'sinput1_F': feats_batch1,
         'correspondences': matching_inds_batch,
         'T_gt': trans_batch,
-        'len_batch': len_batch,
-        'extra_packages': extra_packages,
+        'len_batch': np.asarray(len_batch, dtype=np.int),
+        'extra_packages': extra_packages_batch,
     }
 
 

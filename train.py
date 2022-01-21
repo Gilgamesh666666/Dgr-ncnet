@@ -16,19 +16,16 @@ from config import get_config
 
 from dataloader.data_loaders import make_data_loader
 
-from core.mytrainer1 import WeightedProcrustesTrainer
+from core.mytrainer import WeightedProcrustesTrainer
 
-ch = logging.StreamHandler(sys.stdout)
-logging.getLogger().setLevel(logging.INFO)
-logging.basicConfig(format='%(asctime)s %(message)s',
-                    datefmt='%m/%d %H:%M:%S',
-                    handlers=[ch])
+from datetime import datetime
+now = datetime.now()
+logging.basicConfig(filename=f'train_{now.strftime("%m_%d_%H_%M")}.log',format='%(asctime)s %(message)s',
+                    datefmt='%m/%d %H:%M:%S',level=logging.INFO)#,
+                    #handlers=[ch])
 
 torch.manual_seed(0)
 torch.cuda.manual_seed(0)
-
-logging.basicConfig(level=logging.INFO, format="")
-
 
 def main(config, resume=False):
   train_loader = make_data_loader(config,
@@ -67,9 +64,9 @@ if __name__ == "__main__":
         dconfig[k] = resume_config[k]
     dconfig['resume'] = resume_config['out_dir'] + '/checkpoint.pth'
 
-  # logging.info('===> Configurations')
-  # for k in dconfig:
-  #   logging.info('    {}: {}'.format(k, dconfig[k]))
+  logging.info('===> Configurations')
+  for k in dconfig:
+    logging.info('    {}: {}'.format(k, dconfig[k]))
 
   # Convert to dict
   config = edict(dconfig)

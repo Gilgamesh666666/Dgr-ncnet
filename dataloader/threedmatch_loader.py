@@ -31,6 +31,7 @@ class IndoorPairDataset(PairDataset):
                          manual_seed, config)
     self.root = root = config.threed_match_dir
     self.use_xyz_feature = config.use_xyz_feature
+    self.inlier_knn = config.inlier_knn
     logging.info(f"Loading the subset {phase} from {root}")
 
     subset_names = open(self.DATA_FILES[phase]).read().split()
@@ -88,11 +89,11 @@ class IndoorPairDataset(PairDataset):
     # pcd1.colors = o3d.utility.Vector3dVector(color1[sel1])
 
     # Get matches
-    matches01 = get_matching_indices(pcd0, pcd1, trans, matching_search_voxel_size)
-    matches10 = get_matching_indices(pcd0, pcd1, np.linalg.inv(trans), matching_search_voxel_size)
+    matches01 = get_matching_indices(pcd0, pcd1, trans, matching_search_voxel_size, K=self.inlier_knn)
+    matches10 = get_matching_indices(pcd1, pcd0, np.linalg.inv(trans), matching_search_voxel_size, K=self.inlier_knn)
     matches01 = np.asarray(matches01)
     matches10 = np.asarray(matches10)
-    matches10 = np.concatnate((matches10[:,1][:,None], matches10[:,0][:,None]), axis=1)
+    matches10 = np.concatenate((matches10[:,1][:,None], matches10[:,0][:,None]), axis=1)
     npts0 = len(sel0)
     npts1 = len(sel1)
     hash_seed = max(npts0, npts1)
@@ -101,8 +102,13 @@ class IndoorPairDataset(PairDataset):
     mask = np.isin(hash_vec10, hash_vec01)
     unique_mask = np.logical_not(mask)
     unique_matches10 = matches10[unique_mask]
-    matches = np.concatnate((matches01, unique_matches10), axis=0)
+    matches = np.concatenate((matches01, unique_matches10), axis=0)
     bil_agree_matches = matches10[mask]
+    #print(f'pcd0={sel0.shape}, pcd1={sel1.shape}, bil_agree_matches={bil_agree_matches.shape},matches01={matches01.shape},matches10={matches10.shape}, matches={matches.shape}')
+    #----------------------------------------
+    matches = bil_agree_matches
+    #----------------------------------------
+
     # Get features
     
     feats_train0, feats_train1 = [], []
@@ -132,7 +138,7 @@ class IndoorPairDataset(PairDataset):
 
     return (unique_xyz0_th.float(),
             unique_xyz1_th.float(), coords0.int(), coords1.int(), feats0.float(),
-            feats1.float(), matches, bil_agree_matches, trans, extra_package)
+            feats1.float(), matches, trans, extra_package)
 
 
 class ThreeDMatchPairDataset03(IndoorPairDataset):

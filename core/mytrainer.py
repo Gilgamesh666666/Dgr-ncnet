@@ -28,12 +28,57 @@ import core.registration as GlobalRegistration
 
 from util.timer import Timer, AverageMeter
 from util.file import ensure_dir
-
+from util.hash import _hash
+import copy
 import MinkowskiEngine as ME
-
+import traceback
+from extension.sms import soft_mutual_score_Module
+import numba as nb
 eps = np.finfo(float).eps
 np2th = torch.from_numpy
 
+#@nb.jit(nopython=True)
+def checknan(tensor): 
+  if isinstance(tensor, np.ndarray): 
+    return np.isnan(tensor).astype(np.int16).sum() 
+  elif isinstance(tensor, torch.Tensor): 
+    return torch.isnan(tensor).int().sum().item() 
+  elif isinstance(tensor, (list, tuple)):
+    for item in tensor:
+      if checknan(item):
+        return True
+  else:
+    return NotImplemented
+#@nb.jit(nopython=True)
+def checkinf(tensor): 
+  if isinstance(tensor, np.ndarray): 
+    return np.isinf(tensor).astype(np.int16).sum() 
+  elif isinstance(tensor, torch.Tensor): 
+    return torch.isinf(tensor).int().sum().item() 
+  elif isinstance(tensor, (list, tuple)):
+    for item in tensor:
+      if checkinf(item):
+        return True
+  else:
+    return NotImplemented
+
+def CHECK(tensor, name):
+  nannum = checknan(tensor)
+  infnum = checkinf(tensor)
+  if  nannum or infnum:
+    if not nannum:
+      logging.info(f'{name} has {infnum} inf\n{name}={tensor}')
+      exit(-1)
+    elif not infnum: 
+      logging.info(f'{name} has {nannum} nan\n{name}={tensor}')
+      exit(-1)
+    else:
+      logging.info(f'{name} has {nannum} nan and {infnum} inf\n{name}={tensor}')
+      exit(-1)
+
+def batch_CHECK(tensors, names):
+  for tensor, name in zip(tensors, names):
+    CHECK(tensor, name)
 
 class WeightedProcrustesTrainer:
   def __init__(self, config, data_loader, val_data_loader=None):
@@ -46,7 +91,7 @@ class WeightedProcrustesTrainer:
                       'training is performed on CPU.')
       raise ValueError('GPU not available, but cuda flag set')
     self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
+
     self.config = config
 
     # Training config
@@ -59,13 +104,15 @@ class WeightedProcrustesTrainer:
 
     self.iter_size = config.iter_size
     self.batch_size = data_loader.batch_size
-
+    self.ws_thresh = config.ws_thresh
     # Validation config
     self.val_max_iter = config.val_max_iter
     self.val_epoch_freq = config.val_epoch_freq
     self.best_val_metric = config.best_val_metric
     self.best_val_epoch = -np.inf
     self.best_val = -np.inf
+
+    self.with_sms = config.with_sms
 
     self.val_data_loader = val_data_loader
     self.test_valid = True if self.val_data_loader is not None else False
@@ -85,7 +132,7 @@ class WeightedProcrustesTrainer:
                                 conv1_kernel_size=config.feat_conv1_kernel_size,
                                 normalize_feature=config.normalize_feature).to(
                                     self.device)
-    logging.info(self.feat_model)
+    #logging.info(self.feat_model)
 
     self.inlier_model = InlierModel(num_feats,
                                     1,
@@ -93,7 +140,7 @@ class WeightedProcrustesTrainer:
                                     conv1_kernel_size=config.inlier_conv1_kernel_size,
                                     normalize_feature=False,
                                     D=6).to(self.device)
-    logging.info(self.inlier_model)
+    #logging.info(self.inlier_model)
 
     # Loss and optimizer
     self.clip_weight_thresh = self.config.clip_weight_thresh
@@ -116,6 +163,7 @@ class WeightedProcrustesTrainer:
               sort_keys=False)
 
     self._load_weights(config)
+
 
   def train(self):
     """
@@ -154,40 +202,135 @@ class WeightedProcrustesTrainer:
               f'Current best val model with {self.best_val_metric}: {self.best_val} at epoch {self.best_val_epoch}'
           )
   def inference(self, input_dict):
-
+    # unpack input dictionary
+    xyz0s=input_dict['pcd0']
+    xyz1s=input_dict['pcd1']
+    iC0=input_dict['sinput0_C']
+    iC1=input_dict['sinput1_C']
+    iF0=input_dict['sinput0_F']
+    iF1=input_dict['sinput1_F']
+    len_batch=input_dict['len_batch']
+    pos_pairs=input_dict['correspondences']
+    batch_CHECK((xyz0s, xyz1s, iC0, iC1, iF0, iF1, len_batch, pos_pairs), ('xyz0s','xyz1s','iC0','iC1','iF0', 'iF1', 'len_batch', 'pos_pairs'))
+    
+    # for xyz0, xyz1, lens in zip(xyz0s, xyz1s, len_batch):
+    #     print(f'xyz0={xyz0.shape}, xyz1={xyz1.shape}, lens={lens}')
     stime = time.time()
-    sinput0 = ME.SparseTensor(input_dict['sinput0_F'], coords=input_dict['sinput0_C']).to(self.device)
+    sinput0 = ME.SparseTensor(iF0, coords=iC0).to(self.device)
     oF0 = self.feat_model(sinput0).F
 
-    sinput1 = ME.SparseTensor(input_dict['sinput1_F'], coords=input_dict['sinput1_C']).to(self.device)
+    sinput1 = ME.SparseTensor(iF1, coords=iC1).to(self.device)
     oF1 = self.feat_model(sinput1).F
     feat_time = time.time() - stime
-
+    batch_CHECK((oF0, oF1), ('oF0', 'oF1'))
+    
     # TODO:
     # oF0 find knn in oF1
     # oF1 find knn in oF0
+    # concatenate them
+    # delete dulplicate
+    # calculate the correlation between knns
+    # add soft mutual score
+    # consensus fliter
+    # add soft mutual score
+    # bilateral matches supervise
     
+    stime = time.time()
+    # with torch.no_grad():
+    #   total_matches, bil_agree_matches = self.find_pairs_bilateral(oF0, oF1, len_batch, self.config.inlier_knn, False)
+    #---------------------------------------------------------
+    len_batch_reverse = copy.deepcopy(len_batch)
+    len_batch_reverse[:, [0, 1]] = len_batch_reverse[:, [1, 0]]
+    
+    with torch.no_grad():
+      # oF0 find knn in oF1
+      pred_matches01 = self.find_pairs(xyz0s, xyz1s, oF0, oF1, len_batch, self.config.inlier_knn, self.config.nn_max_n, False, self.config.knn_search_method)
+      # oF1 find knn in oF0
+      reverse_pred_matches10 = self.find_pairs(xyz1s, xyz0s, oF1, oF0, len_batch_reverse, self.config.inlier_knn, self.config.nn_max_n, False, self.config.knn_search_method)
+      pred_matches10 = []
+      for nns10 in reverse_pred_matches10:
+        nns10[:, [0,1]] = nns10[:, [1,0]]
+        pred_matches10.append(nns10)
+      # concatenate them, delete dulplicate
+      total_matches = []
+      bil_agree_matches = []
+      for xyz0, xyz1, nns01, nns10, lens in zip(xyz0s, xyz1s, pred_matches01, pred_matches10, len_batch):
+        N0, N1 = lens
+        hashseed = max(N0, N1)
+        hash_vec01 = _hash(nns01.cpu().numpy(), hashseed)
+        hash_vec10 = _hash(nns10.cpu().numpy(), hashseed)
+        mask = np.isin(hash_vec10, hash_vec01)
+        mask_not = np.logical_not(mask)
+        totalnns = torch.cat((nns01, nns10[mask_not, :]), 0)
+        total_matches.append(totalnns)
+        bil_agree_matches.append(nns10[mask, :])
+    #-----------------------------------------------------------------
+    nn_time = time.time() - stime
+    batch_CHECK((total_matches, bil_agree_matches), ('total_matches', 'bil_agree_matches'))
+    stime = time.time()
+    # calculate the correlation between knns
+    with torch.no_grad():
+      cat_pred_pairs = []
+      start_inds = torch.zeros((1, 2)).long()
+      for lens, pred_pairs in zip(len_batch, total_matches):
+        cat_pred_pairs.append(pred_pairs + start_inds)
+        start_inds += torch.LongTensor(lens)
+      cat_pred_pairs = torch.cat(cat_pred_pairs, 0)
+    feat0 = F.normalize(oF0[cat_pred_pairs[:, 0]], dim=1) # [n1+n2+..nb, c]
+    feat1 = F.normalize(oF1[cat_pred_pairs[:, 1]], dim=1) # [n1+n2+..nb, c]
 
-    reg_coords, reg_feats, pred_pairs, is_correct, feat_time, nn_time = self.generate_inlier_input(
-          xyz0=input_dict['pcd0'],
-          xyz1=input_dict['pcd1'],
-          iC0=input_dict['sinput0_C'],
-          iC1=input_dict['sinput1_C'],
-          iF0=input_dict['sinput0_F'],
-          iF1=input_dict['sinput1_F'],
-          len_batch=input_dict['len_batch'],
-          pos_pairs=input_dict['correspondences'])
+    cat_reg_feat_batch = torch.sum((feat0*feat1), dim=1, keepdim=True) # [n1+n2+..nb, 1]
+    CHECK(cat_reg_feat_batch, 'cat_reg_feat_batch')
+    # add soft mutual score
+    reg_feat_batch = self.decompose_by_length(cat_reg_feat_batch, total_matches)
+    cat_reg_feat_batch = []
+    soft_mutual_cache = []
+    sms = soft_mutual_score_Module()
+    for pred_pair, reg_feat in zip(total_matches, reg_feat_batch):
+      batch_CHECK((pred_pair, reg_feat), ('pred_pair', 'reg_feat'))
+      if self.with_sms:
+        soft_mutual_score = sms(pred_pair.cuda(), reg_feat)
+        CHECK(soft_mutual_score, 'soft_mutual_score')
+        reg_feat = reg_feat.pow(3)/soft_mutual_score
+      cat_reg_feat_batch.append(reg_feat)
+      #soft_mutual_cache.append((len(output0), inverse_indices0, len(output1), inverse_indices1))
+
+    cat_reg_feat_batch = torch.cat(cat_reg_feat_batch, 0)
+    # consensus fliter N(Cab)+N(Cab.t).t
+    reg_coords = torch.cat((iC0[cat_pred_pairs[:, 0]], iC1[cat_pred_pairs[:, 1], 1:]), dim=1)
+    reg_sinput = ME.SparseTensor(cat_reg_feat_batch.contiguous(), coords=reg_coords.int()).to(self.device)
+    batch_CHECK((reg_sinput.coords, reg_sinput.F), ('reg_sinput.coords', 'reg_sinput.feat'))
+    corr6d = self.inlier_model(reg_sinput)
+    batch_CHECK((corr6d.coords, corr6d.F), ('corr6d.coords', 'corr6d.feat'))
     
-    # Inlier prediction with 6D ConvNet
-    stime = time.time()
-    reg_sinput = ME.SparseTensor(reg_feats.contiguous(),
-                                  coords=reg_coords.int()).to(self.device)
-    reg_soutput = self.inlier_model(reg_sinput)
+    reg_coords_reverse = torch.cat((iC1[cat_pred_pairs[:, 1]], iC0[cat_pred_pairs[:, 0], 1:]), dim=1)
+    reg_sinput_reverse = ME.SparseTensor(cat_reg_feat_batch.contiguous(), coords=reg_coords_reverse.int()).to(self.device)
+    # print(reg_sinput_reverse.coords)
+    # print(cat_reg_feat_batch)
+    # print(reg_sinput_reverse.F)
+    corr6d_temp = self.inlier_model(reg_sinput_reverse)
+    batch_CHECK((corr6d_temp.coords, corr6d_temp.F), ('corr6d_temp.coords', 'corr6d_temp.feat'))
+    
+    corr6d_reverse = ME.SparseTensor(corr6d_temp.feats.clone(), coords=corr6d_temp.coords[:, [0,4,5,6,1,2,3]].clone(), coords_manager=corr6d.coords_man,  force_creation=True)
+    scorr = ME.MinkowskiUnion()(corr6d,corr6d_reverse)
+    CHECK(scorr.coords, 'scorr.coords')
     inlier_time = time.time() - stime
-    
+    # # add soft mutual score when test
+    # if is_test:
+    #   corr6d_score = corr6d.F
+    #   for i in range(output0):
+    #       max_c_ijab = reg_feat[inverse_indices0==i].max().values.item()
+    #       soft_mutual_score[inverse_indices0==i] *= max_c_ijab
+    #   for i in range(output1):
+    #     max_c_cdkl = reg_feat[inverse_indices1==i].max().values.item()
+    #     soft_mutual_score[inverse_indices1==i] *= max_c_cdkl
+
+    # bilateral matches supervise
+
     stime = time.time()
-    logits = reg_soutput.F
+    logits = scorr.F
     weights = logits.sigmoid()
+    batch_CHECK((logits, weights), ('logits', 'weights'))
     
     # Truncate weights too low
     # For training, inplace modification is prohibited for backward
@@ -196,14 +339,14 @@ class WeightedProcrustesTrainer:
       valid_mask = weights > self.clip_weight_thresh
       weights_tmp[valid_mask] = weights[valid_mask]
       weights = weights_tmp
-
-    # Weighted Procrustes
-    pred_rots, pred_trans, ws = self.weighted_procrustes(xyz0s=input_dict['pcd0'],
-                                                          xyz1s=input_dict['pcd1'],
-                                                          pred_pairs=pred_pairs,
+      # Weighted Procrustes
+    pred_rots, pred_trans, ws = self.weighted_procrustes(xyz0s=xyz0s,
+                                                          xyz1s=xyz1s,
+                                                          pred_pairs=total_matches,
                                                           weights=weights)
+    batch_CHECK((pred_rots, pred_trans, ws), ('pred_rots', 'pred_trans', 'ws'))
     dgr_time = time.time() - stime
-    return pred_rots, pred_trans, ws, is_correct, feat_time, nn_time, inlier_time, dgr_time
+    return pred_rots, pred_trans, ws, weights, logits, total_matches, bil_agree_matches, (feat_time, nn_time, inlier_time, dgr_time)
 
   def _train_epoch(self, epoch):
     gc.collect()
@@ -250,36 +393,47 @@ class WeightedProcrustesTrainer:
         data_timer.tic()
         input_dict = self.get_data(self.train_data_loader_iter)
         data_time += data_timer.toc(average=False)
-
+        xyz0s=input_dict['pcd0']
+        xyz1s=input_dict['pcd1']
+        len_batch=input_dict['len_batch']
+        # for xyz0, xyz1, lens in zip(xyz0s, xyz1s, len_batch):
+        #     print(f'before xyz0={xyz0.shape}, xyz1={xyz1.shape}, lens={lens}')
         # Initial inlier prediction with FCGF and KNN matching
         # 6维
-        pred_rots, pred_trans, ws, is_correct, time_records = inference(input_dict)
-        
+        pred_rots, pred_trans, ws, weights, logits, total_matches, bil_agree_matches, time_records = self.inference(input_dict)
         # Get batch registration loss
         gt_rots, gt_trans = self.decompose_rotation_translation(input_dict['T_gt'])
         rot_error = batch_rotation_error(pred_rots, gt_rots)
         trans_error = batch_translation_error(pred_trans, gt_trans)
         individual_loss = rot_error + self.config.trans_weight * trans_error
-
+        CHECK(individual_loss, 'individual_loss')
         # Select batches with at least 10 valid correspondences
-        valid_mask = ws > 10
+        valid_mask = ws > self.ws_thresh
         num_valid = valid_mask.sum().item()
-        
+
         # Registration loss against registration GT
         loss = self.config.procrustes_loss_weight * individual_loss[valid_mask].mean()
-        
+        reg_loss = loss.item()
         if not np.isfinite(loss.item()):
           max_val = loss.item()
-          logging.info('Loss is infinite, abort ')
+          logging.info(f'individual_loss = {individual_loss}')
+          logging.info(f'ws = {ws.data}')
+          logging.info(f'num_valid = {num_valid}')
+          logging.info(f'Loss is infinite, abort max_val={max_val}')
           continue
         # 之前算出来的is_correct作为监督,监督correspondence confidence prediction的结果
         # Direct inlier loss against nearest neighbor searched GT
+        is_correct = find_correct_correspondence(input_dict['correspondences'], total_matches, len_batch=input_dict['len_batch'])
         target = torch.from_numpy(is_correct).squeeze()
         if self.config.inlier_use_direct_loss:
           inlier_loss = self.config.inlier_direct_loss_weight * self.crit(
               logits.cpu().squeeze(), target.to(torch.float)) / iter_size
           loss += inlier_loss
-
+        current_step = iter_idx + curr_iter*iter_size + epoch*num_train_iter*iter_size
+        self.writer.add_scalar(f'train/total_loss', loss.item(), current_step)
+        self.writer.add_scalar(f'train/reg_loss', reg_loss, current_step)
+        self.writer.add_scalar(f'train/inlier_loss', inlier_loss, current_step)
+        logging.info(f'Registration loss={reg_loss}, total loss={loss.item()}, inlier_loss={inlier_loss}')
         loss.backward()
 
         # Update statistics before backprop
@@ -288,7 +442,9 @@ class WeightedProcrustesTrainer:
           average_valid_meter.update(num_valid)
           nn_timer.update(nn_time)
           inlier_timer.update(inlier_time)
-          hit_ratio = is_correct.sum().item() / len(is_correct)
+          data_meter.update(data_time)
+          is_correct_fot_hit_ratio = find_correct_correspondence(input_dict['correspondences'], bil_agree_matches, len_batch=input_dict['len_batch'])
+          hit_ratio_meter.update(is_correct_fot_hit_ratio.sum().item() / len(is_correct_fot_hit_ratio))
 
           regist_rre_meter.update(rot_error.squeeze() * 180 / np.pi)
           regist_rte_meter.update(trans_error.squeeze())
@@ -324,50 +480,35 @@ class WeightedProcrustesTrainer:
       total_loss += batch_loss
       total_num += 1.0
       total_timer.toc()
-      data_meter.update(data_time)
       loss_meter.update(batch_loss)
-      hit_ratio_meter.update()
+
       # Output to logs
-      if curr_iter % self.config.stat_freq == 0:
+      if (curr_iter) % self.config.stat_freq == 0:
         precision = tp / (tp + fp + eps)
         recall = tp / (tp + fn + eps)
         f1 = 2 * (precision * recall) / (precision + recall + eps)
         tpr = tp / (tp + fn + eps)
         tnr = tn / (tn + fp + eps)
         balanced_accuracy = (tpr + tnr) / 2
-        
-        
-        stat = {
-            'loss': loss_meter.avg,
-            'precision': precision,
-            'recall': recall,
-            'tpr': tpr,
-            'tnr': tnr,
-            'balanced_accuracy': balanced_accuracy,
-            'f1': f1,
-            'num_valid': average_valid_meter.avg,
-        }
-
-        for k, v in stat.items():
-          self.writer.add_scalar(f'train/{k}', v, start_iter + curr_iter)
 
         logging.info(' '.join([
             f"Train Epoch: {epoch} [{curr_iter}/{num_train_iter}],",
-            f"Current Loss: {loss_meter.avg:.3e},",
-            f"hit ratio: {hit_ratio_meter.avg:.3e}",
+            f"Current Loss: {loss_meter.avg:.3f},",
+            f"hit ratio: {hit_ratio_meter.avg:.3f}",
             f", Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f},",
             f"TPR: {tpr:.4f}, TNR: {tnr:.4f}, BAcc: {balanced_accuracy:.4f}",
-            f"RTE: {regist_rte_meter.avg:.3e}, RRE: {regist_rre_meter.avg:.3e},",
-            f"Succ rate: {regist_succ_meter.avg:3e}",
-            f"Avg num valid: {average_valid_meter.avg:3e}",
+            f"RTE: {regist_rte_meter.avg:.3f}, RRE: {regist_rre_meter.avg:.3f},",
+            f"Succ rate: {regist_succ_meter.avg:3f}",
+            f"Avg num valid: {average_valid_meter.avg:3f}",
             f"\tData time: {data_meter.avg:.4f}, Train time: {total_timer.avg - data_meter.avg:.4f},",
-            f"NN search time: {nn_timer.avg:.3e}, Total time: {total_timer.avg:.4f}"
+            f"NN search time: {nn_timer.avg:.3f}, Total time: {total_timer.avg:.4f}"
         ]))
 
         loss_meter.reset()
         regist_rte_meter.reset()
         regist_rre_meter.reset()
         regist_succ_meter.reset()
+        hit_ratio_meter.reset()
         average_valid_meter.reset()
         data_meter.reset()
         total_timer.reset()
@@ -376,106 +517,135 @@ class WeightedProcrustesTrainer:
 
   def _valid_epoch(self):
     # Change the network to evaluation mode
-    self.feat_model.eval()
-    self.inlier_model.eval()
-    self.val_data_loader.dataset.reset_seed(0)
+    with torch.no_grad():
+      self.feat_model.eval()
+      self.inlier_model.eval()
+      self.val_data_loader.dataset.reset_seed(0)
 
-    num_data = 0
-    loss_meter = AverageMeter()
-    hit_ratio_meter = AverageMeter()
-    regist_succ_meter = AverageMeter()
-    regist_rte_meter = AverageMeter()
-    regist_rre_meter = AverageMeter()
-    data_timer = Timer()
-    feat_timer = Timer()
-    inlier_timer = Timer()
-    nn_timer = Timer()
-    dgr_timer = Timer()
+      num_data = 0
+      loss_meter = AverageMeter()
+      hit_ratio_meter = AverageMeter()
+      regist_succ_meter = AverageMeter()
+      regist_rte_meter = AverageMeter()
+      regist_rre_meter = AverageMeter()
+      average_valid_meter = AverageMeter()
+      data_timer = Timer()
+      feat_timer = Timer()
+      inlier_timer = Timer()
+      nn_timer = Timer()
+      dgr_timer = Timer()
 
-    tot_num_data = len(self.val_data_loader.dataset)
-    if self.val_max_iter > 0:
-      tot_num_data = min(self.val_max_iter, tot_num_data)
-    tot_num_data = int(tot_num_data / self.val_data_loader.batch_size)
-    data_loader_iter = self.val_data_loader.__iter__()
+      tot_num_data = len(self.val_data_loader.dataset)
+      if self.val_max_iter > 0:
+        tot_num_data = min(self.val_max_iter, tot_num_data)
+      tot_num_data = int(tot_num_data / self.val_data_loader.batch_size)
+      data_loader_iter = self.val_data_loader.__iter__()
 
-    tp, fp, tn, fn = 0, 0, 0, 0
-    for batch_idx in range(tot_num_data):
-      data_timer.tic()
-      input_dict = self.get_data(data_loader_iter)
-      data_timer.toc()
+      tp, fp, tn, fn = 0, 0, 0, 0
+      for batch_idx in range(tot_num_data):
+        data_timer.tic()
+        input_dict = self.get_data(data_loader_iter)
+        data_timer.toc()
 
-      hit_ratio_meter.update(hit_ratio)
-      valid_mask = ws > 10
-      gt_rots, gt_trans = self.decompose_rotation_translation(input_dict['T_gt'])
-      rot_error = batch_rotation_error(pred_rots, gt_rots) * 180 / np.pi
-      trans_error = batch_translation_error(pred_trans, gt_trans)
+        pred_rots, pred_trans, ws, weights, logits, total_matches, bil_agree_matches, time_records = self.inference(input_dict)
 
-      regist_rre_meter.update(rot_error.squeeze())
-      regist_rte_meter.update(trans_error.squeeze())
+        gt_rots, gt_trans = self.decompose_rotation_translation(input_dict['T_gt'])
+        rot_error = batch_rotation_error(pred_rots, gt_rots) * 180 / np.pi
+        trans_error = batch_translation_error(pred_trans, gt_trans)
 
-      # Compute success
-      success = (trans_error < self.config.success_rte_thresh) * (
-          rot_error < self.config.success_rre_thresh) * valid_mask
-      regist_succ_meter.update(success.float())
+        individual_loss = rot_error + self.config.trans_weight * trans_error
 
-      target = torch.from_numpy(is_correct).squeeze()
-      neg_target = (~target).to(torch.bool)
-      pred = weights > 0.5  # TODO thresh
-      pred_on_pos, pred_on_neg = pred[target], pred[neg_target]
-      tp += pred_on_pos.sum().item()
-      fp += pred_on_neg.sum().item()
-      tn += (~pred_on_neg).sum().item()
-      fn += (~pred_on_pos).sum().item()
+        # Select batches with at least 10 valid correspondences
+        valid_mask = ws >= self.ws_thresh
+        num_valid = valid_mask.sum().item()
 
-      num_data += 1
-      torch.cuda.empty_cache()
+        # Registration loss against registration GT
+        loss = self.config.procrustes_loss_weight * individual_loss[valid_mask].mean()
 
-      if batch_idx % self.config.stat_freq == 0:
-        precision = tp / (tp + fp + eps)
-        recall = tp / (tp + fn + eps)
-        f1 = 2 * (precision * recall) / (precision + recall + eps)
-        tpr = tp / (tp + fn + eps)
-        tnr = tn / (tn + fp + eps)
-        balanced_accuracy = (tpr + tnr) / 2
-        logging.info(' '.join([
-            f"Validation iter {num_data} / {tot_num_data} : Data Loading Time: {data_timer.avg:.3e},",
-            f"NN search time: {nn_timer.avg:.3e}",
-            f"Feature Extraction Time: {feat_timer.avg:.3e}, Inlier Time: {inlier_timer.avg:.3e},",
-            f"Loss: {loss_meter.avg:.4f}, Hit Ratio: {hit_ratio_meter.avg:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}, ",
-            f"TPR: {tpr:.4f}, TNR: {tnr:.4f}, BAcc: {balanced_accuracy:.4f}, ",
-            f"DGR RTE: {regist_rte_meter.avg:.3e}, DGR RRE: {regist_rre_meter.avg:.3e}, DGR Time: {dgr_timer.avg:.3e}",
-            f"DGR Succ rate: {regist_succ_meter.avg:3e}",
-        ]))
-        data_timer.reset()
+        is_correct = find_correct_correspondence(input_dict['correspondences'], total_matches, len_batch=input_dict['len_batch'])
+        target = torch.from_numpy(is_correct).squeeze()
+        if self.config.inlier_use_direct_loss:
+            inlier_loss = self.config.inlier_direct_loss_weight * self.crit(
+                logits.cpu().squeeze(), target.to(torch.float)) / self.iter_size
+            loss += inlier_loss
+        loss_meter.update(loss.item())
 
-    precision = tp / (tp + fp + eps)
-    recall = tp / (tp + fn + eps)
-    f1 = 2 * (precision * recall) / (precision + recall + eps)
-    tpr = tp / (tp + fn + eps)
-    tnr = tn / (tn + fp + eps)
-    balanced_accuracy = (tpr + tnr) / 2
+        regist_rre_meter.update(rot_error.squeeze())
+        regist_rte_meter.update(trans_error.squeeze())
 
-    logging.info(' '.join([
-        f"Feature Extraction Time: {feat_timer.avg:.3e}, NN search time: {nn_timer.avg:.3e}",
-        f"Inlier Time: {inlier_timer.avg:.3e}, Final Loss: {loss_meter.avg}, ",
-        f"Loss: {loss_meter.avg}, Hit Ratio: {hit_ratio_meter.avg:.4f}, Precision: {precision}, Recall: {recall}, F1: {f1}, ",
-        f"TPR: {tpr}, TNR: {tnr}, BAcc: {balanced_accuracy}, ",
-        f"RTE: {regist_rte_meter.avg:.3e}, RRE: {regist_rre_meter.avg:.3e}, DGR Time: {dgr_timer.avg:.3e}",
-        f"DGR Succ rate: {regist_succ_meter.avg:3e}",
-    ]))
+        # Compute success
+        success = (trans_error < self.config.success_rte_thresh) * (
+            rot_error < self.config.success_rre_thresh) * valid_mask
+        
+        regist_succ_meter.update(success.float())
+        #logging.info(f'pred_rots={pred_rots}\ngt_rots={gt_rots}\nre:{rot_error.squeeze()}\nte:{trans_error.squeeze()}\nsum:{regist_succ_meter.sum}, count:{regist_succ_meter.count}')
+        
+        is_correct_fot_hit_ratio = find_correct_correspondence(input_dict['correspondences'], bil_agree_matches, len_batch=input_dict['len_batch'])
+        hit_ratio_meter.update(is_correct_fot_hit_ratio.sum().item() / len(is_correct_fot_hit_ratio))
 
-    stat = {
-        'loss': loss_meter.avg,
-        'precision': precision,
-        'recall': recall,
-        'tpr': tpr,
-        'tnr': tnr,
-        'balanced_accuracy': balanced_accuracy,
-        'f1': f1,
-        'regist_rte': regist_rte_meter.avg,
-        'regist_rre': regist_rre_meter.avg,
-        'succ_rate': regist_succ_meter.avg
-    }
+        feat_time, nn_time, inlier_time, dgr_time = time_records
+        average_valid_meter.update(num_valid)
+        feat_timer.update(feat_time)
+        nn_timer.update(nn_time)
+        inlier_timer.update(inlier_time)
+
+        neg_target = (~target).to(torch.bool)
+        pred = weights > 0.5  # TODO thresh
+        pred_on_pos, pred_on_neg = pred[target], pred[neg_target]
+        tp += pred_on_pos.sum().item()
+        fp += pred_on_neg.sum().item()
+        tn += (~pred_on_neg).sum().item()
+        fn += (~pred_on_pos).sum().item()
+
+        num_data += 1
+        torch.cuda.empty_cache()
+
+        if batch_idx % self.config.stat_freq == 0:
+          precision = tp / (tp + fp + eps)
+          recall = tp / (tp + fn + eps)
+          f1 = 2 * (precision * recall) / (precision + recall + eps)
+          tpr = tp / (tp + fn + eps)
+          tnr = tn / (tn + fp + eps)
+          balanced_accuracy = (tpr + tnr) / 2
+          logging.info(' '.join([
+              f"Validation iter {num_data} / {tot_num_data} : Data Loading Time: {data_timer.avg:.3f},",
+              f"NN search time: {nn_timer.avg:.3f}, average num valid:{average_valid_meter.avg:.3f}",
+              f"Feature Extraction Time: {feat_timer.avg:.3f}, Inlier Time: {inlier_timer.avg:.3f},",
+              f"Loss: {loss_meter.avg:.4f}, Hit Ratio: {hit_ratio_meter.avg:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}, ",
+              f"TPR: {tpr:.4f}, TNR: {tnr:.4f}, BAcc: {balanced_accuracy:.4f}, ",
+              f"DGR RTE: {regist_rte_meter.avg:.3f}, DGR RRE: {regist_rre_meter.avg:.3f}, DGR Time: {dgr_timer.avg:.3f}",
+              f"DGR Succ rate: {regist_succ_meter.avg:3f}",
+          ]))
+          data_timer.reset()
+
+      precision = tp / (tp + fp + eps)
+      recall = tp / (tp + fn + eps)
+      f1 = 2 * (precision * recall) / (precision + recall + eps)
+      tpr = tp / (tp + fn + eps)
+      tnr = tn / (tn + fp + eps)
+      balanced_accuracy = (tpr + tnr) / 2
+
+      logging.info(' '.join([
+          f"Feature Extraction Time: {feat_timer.avg:.3f}, NN search time: {nn_timer.avg:.3f}",
+          f"Inlier Time: {inlier_timer.avg:.3f}, Final Loss: {loss_meter.avg}, ",
+          f"Loss: {loss_meter.avg}, Hit Ratio: {hit_ratio_meter.avg:.4f}, Precision: {precision}, Recall: {recall}, F1: {f1}, ",
+          f"TPR: {tpr}, TNR: {tnr}, BAcc: {balanced_accuracy}, ",
+          f"RTE: {regist_rte_meter.avg:.3f}, RRE: {regist_rre_meter.avg:.3f}, DGR Time: {dgr_timer.avg:.3f}",
+          f"DGR Succ rate: {regist_succ_meter.avg:3f}",
+      ]))
+
+      stat = {
+          'loss': loss_meter.avg,
+          'precision': precision,
+          'recall': recall,
+          'tpr': tpr,
+          'tnr': tnr,
+          'balanced_accuracy': balanced_accuracy,
+          'f1': f1,
+          'regist_rte': regist_rte_meter.avg,
+          'regist_rre': regist_rre_meter.avg,
+          'succ_rate': regist_succ_meter.avg
+      }
 
     return stat
 
@@ -496,7 +666,7 @@ class WeightedProcrustesTrainer:
         logging.info("=> loading checkpoint '{}'".format(config.resume))
         state = torch.load(config.resume)
 
-        self.start_epoch = state['epoch']
+        self.start_epoch = state['epoch'] + 1
         self.feat_model.load_state_dict(state['state_dict'])
         self.feat_model = self.feat_model.to(self.device)
         self.scheduler.load_state_dict(state['scheduler'])
@@ -572,7 +742,7 @@ class WeightedProcrustesTrainer:
     decomposed_weights = self.decompose_by_length(weights, pred_pairs)
     RT = []
     ws = []
-    
+
     for xyz0, xyz1, pred_pair, w in zip(xyz0s, xyz1s, pred_pairs, decomposed_weights):
       xyz0.requires_grad = False
       xyz1.requires_grad = False
@@ -590,82 +760,24 @@ class WeightedProcrustesTrainer:
     ws = torch.Tensor(ws)
     return Rs, ts, ws
 
-  def generate_inlier_features(self, xyz0, xyz1, C0, C1, F0, F1, pair_ind0, pair_ind1):
-    """
-    Assume that the indices 0 and indices 1 gives the pairs in the
-    (downsampled) correspondences.
-    """
-    assert len(pair_ind0) == len(pair_ind1)
-    reg_feat_type = self.config.inlier_feature_type
-    assert reg_feat_type in ['ones', 'coords', 'counts', 'feats','correlation']
-
-    # Move coordinates and indices to the device
-    if 'coords' in reg_feat_type:
-      C0 = C0.to(self.device)
-      C1 = C1.to(self.device)
-
-    # TODO: change it to append the features and then concat at last
-    if reg_feat_type == 'ones':
-      reg_feat = torch.ones((len(pair_ind0), 1)).to(torch.float32)
-    elif reg_feat_type == 'feats':
-      reg_feat = torch.cat((F0[pair_ind0], F1[pair_ind1]), dim=1)
-    elif reg_feat_type == 'coords':
-      reg_feat = torch.cat((torch.cos(torch.cat(
-          xyz0, 0)[pair_ind0]), torch.cos(torch.cat(xyz1, 0)[pair_ind1])),
-                           dim=1)
-    elif reg_feat_type == 'correlation':
-      feat0 = F.normalize(F0[pair_ind0]) # [n1+n2+..nb, c]
-      feat1 = F.normalize(F1[pair_ind1]) # [n1+n2+..nb, c]
-      reg_feat = torch.sum((feat0*feat1), dim=1, keepdim=True)
-    else:
-      raise ValueError('Inlier feature type not defined')
-
-    return reg_feat
-
-  def generate_inlier_input(self, xyz0, xyz1, iC0, iC1, iF0, iF1, len_batch, pos_pairs):
-    # 所有点的feature的correspondence都计算出来
-    # pairs consist of (xyz1 index, xyz0 index)
-    len_batch_arr = np.asarray(len_batch)
-    len_batch_reverse = np.concatnate((len_batch_arr[:,1][:, None], len_batch_arr[:,0][:, None]), axis=1)
-    
-    
-
-    stime = time.time()
-    # knn的k通过config调
-    pred_pairs01 = self.find_pairs(oF0, oF1, len_batch_arr) #[[若干,2]...batch个]
-    pred_pairs10 = self.find_pairs(oF1, oF0, len_batch_reverse)
-    nn_time = time.time() - stime
-
-    is_correct = find_correct_correspondence(pos_pairs, pred_pairs, len_batch=len_batch)
-
-    cat_pred_pairs = []
-    start_inds = torch.zeros((1, 2)).long()
-    for lens, pred_pair in zip(len_batch, pred_pairs):
-      cat_pred_pairs.append(pred_pair + start_inds)
-      start_inds += torch.LongTensor(lens)
-
-    cat_pred_pairs = torch.cat(cat_pred_pairs, 0)
-    pred_pair_inds0, pred_pair_inds1 = cat_pred_pairs.t()
-    # IC1还有个batch维
-    reg_coords = torch.cat((iC0[pred_pair_inds0], iC1[pred_pair_inds1, 1:]), 1)
-    reg_feats = self.generate_inlier_features(xyz0, xyz1, iC0, iC1, oF0, oF1,
-                                              pred_pair_inds0, pred_pair_inds1).float()
-
-    return reg_coords, reg_feats, pred_pairs, is_correct, feat_time, nn_time
-
-  def find_pairs(self, F0, F1, len_batch):
+  def find_pairs(self, xyz0s, xyz1s, F0, F1, len_batch, k, nn_max_n, return_distance, search_method):
     # 对每一个F0 find一个最近的F1
     nn_batch = find_knn_batch(F0,
                               F1,
                               len_batch,
-                              nn_max_n=self.config.nn_max_n,
-                              knn=self.config.inlier_knn,
-                              return_distance=False,
-                              search_method=self.config.knn_search_method)
-
+                              nn_max_n=nn_max_n,
+                              knn=k,
+                              return_distance=return_distance,
+                              search_method=search_method)
     pred_pairs = []
     # len(nns) == F0.shape[0]
-    for nns, lens in zip(nn_batch, len_batch):
+    for xyz0, xyz1, nns, lens in zip(xyz0s, xyz1s, nn_batch, len_batch):
+      # try:
+      #   c = xyz1[nns]
+      # except Exception as e:
+      #   print(e)
+      #   print(f'xyz0={xyz0.shape}, xyz1={xyz1.shape}, lens={lens}')
+      #   traceback.print_exc()
       pred_pair_ind0, pred_pair_ind1 = torch.arange(
           len(nns)).long()[:, None], nns.long().cpu()
       nn_pairs = []
@@ -673,6 +785,51 @@ class WeightedProcrustesTrainer:
       for j in range(nns.shape[1]):
         nn_pairs.append(
             torch.cat((pred_pair_ind0.cpu(), pred_pair_ind1[:, j].unsqueeze(1)), 1))
-
       pred_pairs.append(torch.cat(nn_pairs, 0))
     return pred_pairs
+
+  def find_pairs_bilateral(self, F0, F1, len_batch, k, return_distance):
+      # 对每一个F0 find一个最近的F1
+      from extension.knn import knnModule
+      knnfunc = knnModule()
+      start0, start1 = 0, 0
+      #[b, c, n] [b, c, m]  
+      total_matches = []
+      bil_agree_matches = []
+      
+      for lens in len_batch:
+        N0, N1 = lens
+        hashseed = max(N0, N1)
+        data1 = F0[start0:start0 + N0].transpose(1, 0).unsqueeze(0)
+        data2 = F1[start1:start1 + N1].transpose(1, 0).unsqueeze(0)
+        idx1, idx2 = knnfunc(data1, data2, k, bilateral=True, return_distance=False, return_index=True)
+        idx1, idx2 = idx1.squeeze(0).transpose(1, 0), idx2.squeeze(0).transpose(1, 0)
+        # 0->1
+        pred_pair_ind0, pred_pair_ind1 = torch.arange(
+            len(idx1)).long()[:, None], idx1.long().cpu()
+        nn_pairs01 = []
+        # 处理knn k>1情况
+        for j in range(pred_pair_ind1.shape[1]):
+          nn_pairs01.append(
+              torch.cat((pred_pair_ind0.cpu(), pred_pair_ind1[:, j].unsqueeze(1)), 1))
+        nns01 = torch.cat(nn_pairs01, 0)
+        # 0<-1
+        pred_pair_ind0, pred_pair_ind1 = idx2.long().cpu(),torch.arange(len(idx2)).long()[:, None]
+        # 处理knn k>1情况
+        nn_pairs10 = []
+        for j in range(pred_pair_ind0.shape[1]):
+          nn_pairs10.append(
+              torch.cat((pred_pair_ind0[:, j].unsqueeze(1), pred_pair_ind1.cpu()), 1))
+        nns10 = torch.cat(nn_pairs10, 0)
+        # delete dulplicate
+        hash_vec01 = _hash(nns01.cpu().numpy(), hashseed)
+        hash_vec10 = _hash(nns10.cpu().numpy(), hashseed)
+        mask = np.isin(hash_vec10, hash_vec01)
+        mask_not = np.logical_not(mask)
+        totalnns = torch.cat((nns01, nns10[mask_not, :]), 0)
+        total_matches.append(totalnns)
+        bil_agree_matches.append(nns10[mask, :])
+        start0 += N0
+        start1 += N1
+        
+      return total_matches, bil_agree_matches

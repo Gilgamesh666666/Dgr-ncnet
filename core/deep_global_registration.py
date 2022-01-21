@@ -12,6 +12,7 @@ import open3d as o3d
 import numpy as np
 import time
 import torch
+import torch.nn.functional as F
 import copy
 import MinkowskiEngine as ME
 
@@ -20,10 +21,10 @@ from model import load_model
 
 from core.registration import GlobalRegistration
 from core.knn import find_knn_gpu
-
+from util.hash import _hash
 from util.timer import Timer
 from util.pointcloud import make_open3d_point_cloud
-
+from extension.sms import soft_mutual_score_Module
 
 # Feature-based registrations in Open3D
 def registration_ransac_based_on_feature_matching(pcd0, pcd1, feats0, feats1,
@@ -126,7 +127,7 @@ class DeepGlobalRegistration:
     self.inlier_model = self.inlier_model.to(self.device)
     self.inlier_model.eval()
     print("=> loading finished")
-
+  
   def preprocess(self, pcd):
     '''
     Stage 0: preprocess raw input point cloud
@@ -164,19 +165,24 @@ class DeepGlobalRegistration:
 
     return self.fcgf_model(sinput).F
 
-  def fcgf_feature_matching(self, feats0, feats1):
+  def fcgf_feature_matching(self, feats0, feats1, k):
     '''
     Step 2: coarsely match FCGF features to generate initial correspondences
     '''
     nns = find_knn_gpu(feats0,
                        feats1,
                        nn_max_n=self.network_config.nn_max_n,
-                       knn=1,
+                       knn=k,
                        return_distance=False)
-    corres_idx0 = torch.arange(len(nns)).long().squeeze()
-    corres_idx1 = nns.long().squeeze()
-
-    return corres_idx0, corres_idx1
+    pred_pair_ind0, pred_pair_ind1 = torch.arange(
+          len(nns)).long()[:, None], nns.long().cpu()
+    nn_pairs = []
+    # 处理knn k>1情况
+    for j in range(nns.shape[1]):
+      nn_pairs.append(
+          torch.cat((pred_pair_ind0.cpu(), pred_pair_ind1[:, j].unsqueeze(1)), 1))
+    
+    return torch.cat(nn_pairs, 0)
 
   def inlier_feature_generation(self, xyz0, xyz1, coords0, coords1, fcgf_feats0,
                                 fcgf_feats1, corres_idx0, corres_idx1):
@@ -246,23 +252,65 @@ class DeepGlobalRegistration:
       fcgf_feats0 = self.fcgf_feature_extraction(feats0, coords0)
       fcgf_feats1 = self.fcgf_feature_extraction(feats1, coords1)
       self.feat_timer.toc()
-
+      # TODO:
+      # oF0 find knn in oF1
+      # oF1 find knn in oF0
+      # concatenate them
+      # delete dulplicate
+      # calculate the correlation between knns
+      # add soft mutual score
+      # consensus fliter
+      # add soft mutual score
+      # bilateral matches supervise
       # Step 2: Coarse correspondences
-      corres_idx0, corres_idx1 = self.fcgf_feature_matching(fcgf_feats0, fcgf_feats1)
+      pred_pairs01 = self.fcgf_feature_matching(fcgf_feats0, fcgf_feats1, k=self.config.inlier_knn)
+      reverse_pred_pairs10 = self.fcgf_feature_matching(fcgf_feats1, fcgf_feats0, k=self.config.inlier_knn)
+      pred_pairs10 = reverse_pred_pairs10[:, [1,0]]
+      N0, N1 = xyz0.shape[0], xyz1.shape[1]
+      hashseed = max(N0, N1)
+      hash_vec01 = _hash(pred_pairs01.cpu().numpy(), hashseed)
+      hash_vec10 = _hash(pred_pairs10.cpu().numpy(), hashseed)
+      mask = np.isin(hash_vec10, hash_vec01)
+      mask_not = np.logical_not(mask)
+      total_matches = torch.cat((pred_pairs01, pred_pairs10[mask_not, :]), 0)
+      bil_agree_matches = pred_pairs10[mask, :]
+      #-------------------------------------------------------------------
+      feat0 = F.normalize(fcgf_feats0[total_matches[:, 0]], dim=1) # [n1, c]
+      feat1 = F.normalize(fcgf_feats1[total_matches[:, 1]], dim=1) # [n1, c]
 
-      # Step 3: Inlier feature generation
-      # coords[corres_idx0]: 1D temporal + 3D spatial coord
-      # coords[corres_idx1, 1:]: 3D spatial coord
-      # => 1D temporal + 6D spatial coord
-      inlier_coords = torch.cat((coords0[corres_idx0], coords1[corres_idx1, 1:]),
-                                dim=1).int()
-      inlier_feats = self.inlier_feature_generation(xyz0, xyz1, coords0, coords1,
-                                                    fcgf_feats0, fcgf_feats1,
-                                                    corres_idx0, corres_idx1)
-
-      # Step 4: Inlier likelihood estimation and truncation
-      logit = self.inlier_prediction(inlier_feats.contiguous(), coords=inlier_coords)
-      weights = logit.sigmoid()
+      reg_feat = torch.sum((feat0*feat1), dim=1, keepdim=True) # [n1, 1]
+      
+      # add soft mutual score
+      sms = soft_mutual_score_Module()
+      soft_mutual_score = sms(total_matches.cuda(), reg_feat)
+      reg_feat_sms = reg_feat.pow(3)/soft_mutual_score
+      # consensus fliter N(Cab)+N(Cab.t).t
+      reg_coords = torch.cat((coords0[total_matches[:, 0]], coords1[total_matches[:, 1], 1:]), dim=1)
+      reg_sinput = ME.SparseTensor(reg_feat_sms.contiguous(), coords=reg_coords.int()).to(self.device)
+      
+      corr6d = self.inlier_model(reg_sinput)
+      
+      reg_coords_reverse = torch.cat((coords1[total_matches[:, 1]], coords0[total_matches[:, 0], 1:]), dim=1)
+      reg_sinput_reverse = ME.SparseTensor(reg_feat_sms.contiguous(), coords=reg_coords_reverse.int()).to(self.device)
+      # print(reg_sinput_reverse.coords)
+      # print(cat_reg_feat_batch)
+      # print(reg_sinput_reverse.F)
+      corr6d_temp = self.inlier_model(reg_sinput_reverse)
+      
+      corr6d_reverse = ME.SparseTensor(corr6d_temp.feats.clone(), coords=corr6d_temp.coords[:, [0,4,5,6,1,2,3]].clone(), coords_manager=corr6d.coords_man,  force_creation=True)
+      scorr = ME.MinkowskiUnion()(corr6d,corr6d_reverse)
+      
+      # # add soft mutual score when test
+      # if is_test:
+      #   scorr = scorr.F
+      #   scorr_sms = sms(total_matches.cuda(), scorr)
+      
+      # bilateral matches supervise
+      logits = scorr.F
+      weights = logits.sigmoid()
+      
+      # Truncate weights too low
+      # For training, inplace modification is prohibited for backward
       if self.clip_weight_thresh > 0:
         weights[weights < self.clip_weight_thresh] = 0
       wsum = weights.sum().item()
@@ -274,10 +322,10 @@ class DeepGlobalRegistration:
     print(f'=> Weighted sum {wsum:.2f} {sign} threshold {wsum_threshold}')
 
     T = np.identity(4)
-    if wsum >= wsum_threshold:
+    if wsum:# >= wsum_threshold:
       try:
-        rot, trans, opt_output = GlobalRegistration(xyz0[corres_idx0],
-                                                    xyz1[corres_idx1],
+        rot, trans, opt_output = GlobalRegistration(xyz0[total_matches[:, 0]],
+                                                    xyz1[total_matches[:, 1]],
                                                     weights=weights.detach().cpu(),
                                                     break_threshold_ratio=1e-4,
                                                     quantization_size=2 *
@@ -301,8 +349,8 @@ class DeepGlobalRegistration:
       pcd1 = make_open3d_point_cloud(xyz1)
       T = self.safeguard_registration(pcd0,
                                       pcd1,
-                                      corres_idx0,
-                                      corres_idx1,
+                                      total_matches[:, 0],
+                                      total_matches[:, 1],
                                       feats0,
                                       feats1,
                                       2 * self.voxel_size,

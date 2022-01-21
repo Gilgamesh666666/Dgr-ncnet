@@ -62,6 +62,7 @@ trainer_arg.add_argument('--trans_weight', type=float, default=1)
 trainer_arg.add_argument('--eval_registration', type=str2bool, default=True)
 trainer_arg.add_argument('--clip_weight_thresh', type=float, default=0.05, help='Weight threshold for detecting inliers')
 trainer_arg.add_argument('--best_val_metric', type=str, default='succ_rate')
+trainer_arg.add_argument('--with_sms', default=False, action='store_true')
 
 # Inlier detection trainer
 inlier_arg = add_argument_group('Inlier')
@@ -71,7 +72,7 @@ inlier_arg.add_argument('--inlier_conv1_kernel_size', type=int, default=3)
 inlier_arg.add_argument('--inlier_knn', type=int, default=1)
 inlier_arg.add_argument('--knn_search_method', type=str, default='gpu')
 inlier_arg.add_argument('--inlier_use_direct_loss', type=str2bool, default=True)
-
+inlier_arg.add_argument('--ws_thresh', type=float, default=10.0)
 # Feature specific configurations
 feat_arg = add_argument_group('feat')
 feat_arg.add_argument('--feat_model', type=str, default='SimpleNetBN2C')
@@ -128,7 +129,7 @@ eval_arg.add_argument('--success_rte_thresh', type=float, default=0.3, help='Suc
 eval_arg.add_argument('--success_rre_thresh', type=float, default=15, help='Success if the RTE below this (degree)')
 eval_arg.add_argument('--test_random_crop', action='store_true')
 eval_arg.add_argument('--test_random_rotation', type=str2bool, default=False)
-
+eval_arg.add_argument('--test_save_dir', type=str, default=None)
 # Demo
 demo_arg = add_argument_group('demo')
 demo_arg.add_argument('--pcd0', default="redkitchen_000.ply", type=str)
